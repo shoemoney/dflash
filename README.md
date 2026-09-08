@@ -284,7 +284,7 @@ Meta's own numbers for the K-Quant-17GB target plus quantized drafter were 1.5x 
 
 ```mermaid
 flowchart LR
-    A[✅ Meta head loads on MLX] --> B[✅ With/without bench] --> C[✅ Abliterated + sampled runs] --> S[✅ Argmax proposals under sampling] --> D[🔨 Upstream PR to z-lab/dflash] --> E[⬜ Wide-verify quantized matmul in MLX] --> F[⬜ mlx-lm server integration]
+    A[✅ Meta head loads on MLX] --> B[✅ With/without bench] --> C[✅ Abliterated + sampled runs] --> S[✅ Argmax proposals under sampling] --> D[✅ Upstream PRs opened] --> E[🔨 Wide-verify quantized matmul in MLX] --> F[⬜ mlx-lm server integration]
 ```
 
 | milestone | state |
@@ -293,8 +293,8 @@ flowchart LR
 | With/without-draft benchmark with token-level artifacts | ✅ done |
 | Abliterated target and published-sampling runs | ✅ done |
 | Argmax proposals for v1 heads under sampling (0.45x to 1.18x) | ✅ done, measured |
-| Upstream PR to z-lab/dflash | 🔨 next |
-| Faster wide-verify path for quantized targets on MLX (unlock block 8 to 16) | ⬜ planned |
+| Upstream PRs to z-lab/dflash: [#168](https://github.com/z-lab/dflash/pull/168) adapter + bench, [#169](https://github.com/z-lab/dflash/pull/169) argmax proposals | ✅ opened |
+| Faster wide-verify path for quantized targets on MLX (unlock block 8 to 16) | 🔨 next |
 | Draft support inside `mlx_lm.server` | ⬜ planned |
 
 ---
