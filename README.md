@@ -39,7 +39,7 @@ Now `meta-models/Muse-Glimmer-30B-assistant` loads straight off Hugging Face int
 | 📦 Block 16 like on CUDA? | **No.** On a quantized MLX target, block 16 is *slower* than no draft at all (0.80x). Use block 5. |
 | 🧊 Does quantizing the 5 GB head to 4-bit hurt? | **No.** Acceptance 2.93 vs 2.99 tokens per step, and it is slightly faster. |
 | 🔓 Does it work on an abliterated target? | **Yes.** Acceptance is unchanged (2.96 vs 2.93). The head was distilled against the stock model but the residual stream it reads survives abliteration. |
-| 🎲 Sampling at temperature 1? | **Not with Meta's v1 head.** Acceptance collapses to 1.16 and throughput halves. See [Caveats](#-caveats). |
+| 🎲 Sampling at temperature 1? | **Yes, after one fix.** z-lab's v1 loop sampled block positions independently and Meta's head collapsed to 0.45x. Proposing argmax and rejection-sampling against it (what vLLM does) brings it to **1.18x** at block 5, same acceptance as greedy. DFlash 2 does 1.28x. |
 
 ---
 
@@ -93,12 +93,14 @@ Six prompts, 256 new tokens each, chat template with `Reasoning strength: low`, 
 | draft | block | tok/s | speedup | accept / step |
 |---|---:|---:|---:|---:|
 | ❌ none | - | 40.1 | 1.00x | - |
-| 🟦 Meta assistant, 4-bit | 5 | 18.2 | 0.45x | 1.16 |
-| 🟦 Meta assistant, 4-bit | 8 | 12.8 | 0.32x | 1.16 |
+| 🟦 Meta assistant, 4-bit, before fix (independent per-position sampling) | 5 | 18.2 | 0.45x | 1.16 |
+| 🟦 Meta assistant, 4-bit, before fix | 8 | 12.8 | 0.32x | 1.16 |
+| 🟦 Meta assistant, 4-bit, argmax proposals | **5** | **47.2** | **1.18x** | 2.96 |
+| 🟦 Meta assistant, 4-bit, argmax proposals | 8 | 38.6 | 0.96x | 3.49 |
 | 🟩 z-lab DFlash 2, 4-bit | **5** | **51.4** | **1.28x** | 3.35 |
 | 🟩 z-lab DFlash 2, 4-bit | 8 | 46.8 | 1.17x | 4.34 |
 
-> 🎲 Same rejection sampler, opposite outcome. DFlash 2 keeps its full greedy speedup under sampling because its candidate selector picks a *coherent* block. z-lab's v1 loop instead samples every block position independently from its marginal, so Meta's head proposes incoherent blocks that the target rejects. vLLM sidesteps this by proposing argmax tokens for v1 heads and rejection-sampling against them; see the roadmap for that change on MLX.
+> 🎲 Same rejection sampler, three outcomes. DFlash 2 keeps its greedy speedup under sampling because its candidate selector picks a *coherent* block. z-lab's v1 loop sampled every block position independently from its marginal, so Meta's head proposed incoherent blocks the target rejected. This branch now proposes the argmax token per position for v1 heads and rejection-samples against a one-hot proposal, which is what vLLM does: the accept test becomes `u < p(token)` and the residual is the target distribution minus that token, so the output distribution is exactly the target's. Acceptance under sampling then matches greedy.
 
 <details>
 <summary>📂 Which JSONL is which</summary>
@@ -110,7 +112,8 @@ Six prompts, 256 new tokens each, chat template with `Reasoning strength: low`, 
 | `C-meta-4bit.jsonl` | C. Meta head 4-bit, blocks 5/8/16, greedy |
 | `C-meta-bf16.jsonl` | C. Meta head bf16, blocks 5/8, greedy |
 | `D-baseline-abl.jsonl`, `D-dflash2-abl.jsonl`, `D-meta-abl.jsonl` | D. Abliterated target |
-| `E-baseline-sampled.jsonl`, `E-meta-sampled.jsonl`, `E-dflash2-sampled.jsonl` | E. Published sampling settings |
+| `E-baseline-sampled.jsonl`, `E-meta-sampled.jsonl`, `E-dflash2-sampled.jsonl` | E. Published sampling settings (`E-meta-sampled` is the pre-fix run) |
+| `E-meta-sampled-argmax.jsonl` | E. Meta head after the argmax-proposal fix |
 
 Each row keeps the full generated token list, so any comparison in this README can be recomputed offline.
 
@@ -224,7 +227,7 @@ python bench/aggregate.py runs/
 
 | file | change |
 |---|---|
-| `dflash/model_mlx.py` | 🗂️ Draft loading goes through a registry keyed on `config.architectures[0]`. Each entry is a model class, a config normalizer, and a weight-key remap. `DFlash2DraftModel` keeps its old behavior; `MuseGlimmerAssistantModel` is new. `num_target_layers` became optional. `bind()` inherits the target's logit multiplier and softcap when the draft config leaves them at defaults. |
+| `dflash/model_mlx.py` | 🗂️ Draft loading goes through a registry keyed on `config.architectures[0]`. Each entry is a model class, a config normalizer, and a weight-key remap. `DFlash2DraftModel` keeps its old behavior; `MuseGlimmerAssistantModel` is new. `num_target_layers` became optional. `bind()` inherits the target's logit multiplier and softcap when the draft config leaves them at defaults. Under sampling, v1 heads now propose argmax tokens and rejection-sample against a one-hot proposal instead of sampling each block position independently. |
 | `dflash/bench_mlx.py` | 📊 New. With/without-draft benchmark that writes one JSONL row per prompt and block size, with the full token list and a SHA-256 of it. |
 | `dflash/bench_prompts.json` | 🧪 New. The six default prompts. |
 | `tests/test_muse_glimmer_adapter.py` | ✅ New. Weight-free: real checkpoint configs and safetensors headers as fixtures; asserts the remapped key set equals the model's parameter set for both heads, and that an unknown architecture raises. 7 tests, pass in under a second. |
@@ -269,7 +272,7 @@ Meta's own numbers for the K-Quant-17GB target plus quantized drafter were 1.5x 
 
 ## ⚠️ Caveats
 
-- 🎲 **Meta's v1 head collapses under sampling.** At temperature 1 with top-p 0.95 and top-k 64 it accepts 1.16 tokens per step, which makes generation *slower* than no draft. DFlash v1 samples each block position from its own marginal, so sampled blocks are incoherent as sequences and the target rejects them. DFlash 2 added a candidate selector (predecessor/successor codebooks) for exactly this. Use the z-lab head if you sample, or run greedy.
+- 🎲 **Sampling with a v1 head needs argmax proposals.** Upstream z-lab's loop samples each block position from its own marginal, and Meta's head then accepts 1.16 tokens per step. This branch proposes argmax for v1 heads (the vLLM behavior), which restores greedy-level acceptance. If you run upstream's loop instead, use the DFlash 2 head when sampling.
 - 📦 **Block sizes above 5 lose on quantized MLX targets.** Acceptance keeps rising but tok/s falls. This is an MLX kernel property at wide verify widths, not a Glimmer property.
 - 🧵 **Single request only.** The MLX loop is batch-1. Server-style concurrency is vLLM territory.
 - 🖼️ **Text only.** mlx-lm's Glimmer port implements the language tower; the perception encoder is dropped at load.
@@ -281,7 +284,7 @@ Meta's own numbers for the K-Quant-17GB target plus quantized drafter were 1.5x 
 
 ```mermaid
 flowchart LR
-    A[✅ Meta head loads on MLX] --> B[✅ With/without bench] --> C[✅ Abliterated + sampled runs] --> D[🔨 Upstream PR to z-lab/dflash] --> E[⬜ Wide-verify quantized matmul in MLX] --> F[⬜ mlx-lm server integration]
+    A[✅ Meta head loads on MLX] --> B[✅ With/without bench] --> C[✅ Abliterated + sampled runs] --> S[✅ Argmax proposals under sampling] --> D[🔨 Upstream PR to z-lab/dflash] --> E[⬜ Wide-verify quantized matmul in MLX] --> F[⬜ mlx-lm server integration]
 ```
 
 | milestone | state |
@@ -289,6 +292,7 @@ flowchart LR
 | Meta's v1 head loads through a draft-adapter registry, tests green | ✅ done, measured on M3 Ultra |
 | With/without-draft benchmark with token-level artifacts | ✅ done |
 | Abliterated target and published-sampling runs | ✅ done |
+| Argmax proposals for v1 heads under sampling (0.45x to 1.18x) | ✅ done, measured |
 | Upstream PR to z-lab/dflash | 🔨 next |
 | Faster wide-verify path for quantized targets on MLX (unlock block 8 to 16) | ⬜ planned |
 | Draft support inside `mlx_lm.server` | ⬜ planned |
